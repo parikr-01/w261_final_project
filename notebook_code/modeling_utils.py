@@ -5,8 +5,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 from pyspark.ml import Pipeline, PipelineModel
 from pyspark.ml.evaluation import RegressionEvaluator
-from pyspark.ml.feature import Imputer, OneHotEncoder, StandardScaler, StringIndexer, VectorAssembler
-from pyspark.ml.regression import GBTRegressor, LinearRegression
+from pyspark.ml.feature import Imputer, OneHotEncoder, StandardScaler, StringIndeload_and_prepare_dataxer, VectorAssembler
+from pyspark.ml.regression import GBTRegressor, LinearRegression, RandomForestRegressor
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 
@@ -397,6 +397,142 @@ def _build_gbt_pipeline(
     return Pipeline(stages=stages)
 
 
+def _build_rf_pipeline(
+    numeric_columns: Sequence[str],
+    categorical_columns: Sequence[str],
+    num_trees: int,
+    # max_depth: int,
+    max_bins: int = 32,
+    subsampling_rate: float = 0.8,
+    seed: int = 42,
+) -> Pipeline:
+    stages = []
+    feature_inputs: List[str] = []
+
+    if categorical_columns:
+        indexed_columns = [f"{column}_idx" for column in categorical_columns]
+        encoded_columns = [f"{column}_ohe" for column in categorical_columns]
+
+        stages.extend(
+            [
+                StringIndexer(inputCol=column, outputCol=indexed, handleInvalid="keep")
+                for column, indexed in zip(categorical_columns, indexed_columns)
+            ]
+        )
+        stages.append(
+            OneHotEncoder(inputCols=indexed_columns, outputCols=encoded_columns, handleInvalid="keep")
+        )
+        feature_inputs.extend(encoded_columns)
+
+    if numeric_columns:
+        imputed_columns = [f"{column}_imp" for column in numeric_columns]
+        stages.append(
+            Imputer(strategy="median", inputCols=list(numeric_columns), outputCols=imputed_columns)
+        )
+        feature_inputs = imputed_columns + feature_inputs
+
+    stages.append(
+        VectorAssembler(inputCols=feature_inputs, outputCol="features", handleInvalid="keep")
+    )
+    stages.append(
+        RandomForestRegressor(
+            featuresCol="features",
+            labelCol="label",
+            predictionCol="prediction",
+            numTrees=int(num_trees),
+            # maxDepth=int(max_depth),
+            # maxBins=int(max_bins),
+            subsamplingRate=float(subsampling_rate),
+            seed=int(seed),
+        )
+    )
+
+    return Pipeline(stages=stages)
+
+
+def search_rf_model(
+    train_df: DataFrame,
+    valid_df: DataFrame,
+    numeric_columns: Sequence[str],
+    categorical_columns: Sequence[str],
+    param_grid: Sequence[Dict[str, float]],
+    model_name: str = "RandomForest",
+    delay_threshold: float = DEFAULT_DELAY_THRESHOLD,
+    severe_delay_threshold: float = DEFAULT_SEVERE_DELAY_THRESHOLD,
+    seed: int = 42,
+) -> Tuple[Dict[str, float], pd.DataFrame]:
+    results = []
+    best_row = None
+
+    for params in param_grid:
+        pipeline = _build_rf_pipeline(
+            numeric_columns=numeric_columns,
+            categorical_columns=categorical_columns,
+            num_trees=int(params["numTrees"]),
+            # max_depth=int(params["maxDepth"]),
+            max_bins=int(params.get("maxBins", 32)),
+            subsampling_rate=float(params.get("subsamplingRate", 0.8)),
+            seed=seed,
+        )
+        model = pipeline.fit(train_df)
+        predictions = model.transform(valid_df).select("label", "prediction").cache()
+        metrics = evaluate_predictions(
+            predictions,
+            delay_threshold=delay_threshold,
+            severe_delay_threshold=severe_delay_threshold,
+        )
+        predictions.unpersist()
+
+        row = {
+            "model": model_name,
+            "split": "validation",
+            "numTrees": int(params["numTrees"]),
+            "maxDepth": int(params["maxDepth"]),
+            "maxBins": int(params.get("maxBins", 32)),
+            "subsamplingRate": float(params.get("subsamplingRate", 0.8)),
+            **metrics,
+        }
+        results.append(row)
+
+        if best_row is None or row["RMSE"] < best_row["RMSE"]:
+            best_row = row
+
+    return best_row, pd.DataFrame(results).sort_values("RMSE").reset_index(drop=True)
+
+
+def fit_rf_model(
+    train_df: DataFrame,
+    numeric_columns: Sequence[str],
+    categorical_columns: Sequence[str],
+    num_trees: int,
+    # max_depth: int,
+    max_bins: int = 32,
+    subsampling_rate: float = 0.8,
+    seed: int = 42,
+) -> PipelineModel:
+    pipeline = _build_rf_pipeline(
+        numeric_columns=numeric_columns,
+        categorical_columns=categorical_columns,
+        num_trees=num_trees,
+        # max_depth=max_depth,
+        max_bins=max_bins,
+        subsampling_rate=subsampling_rate,
+        seed=seed,
+    )
+    return pipeline.fit(train_df)
+
+
+def top_rf_importances(
+    model: PipelineModel,
+    reference_df: DataFrame,
+    top_n: int = 15,
+) -> pd.DataFrame:
+    feature_names = _feature_metadata(model, reference_df)
+    importances = list(model.stages[-1].featureImportances.toArray())
+    table = pd.DataFrame({"feature": feature_names, "importance": importances})
+    return table.sort_values("importance", ascending=False).head(top_n).reset_index(drop=True)
+
+
 def evaluate_predictions(
     predictions: DataFrame,
     label_col: str = "label",
@@ -686,3 +822,287 @@ def top_gbt_importances(
     importances = list(model.stages[-1].featureImportances.toArray())
     table = pd.DataFrame({"feature": feature_names, "importance": importances})
     return table.sort_values("importance", ascending=False).head(top_n).reset_index(drop=True)
+
+
+def load_and_prepare_data(
+    spark,
+    data_path: str,
+    row_filter: Optional[str] = None,
+    target_col: str = "DEP_DELAY",
+    date_col: str = "FL_DATE",
+    train_end: str = "2019-11-15",
+    valid_end: str = "2019-11-30",
+    auto_infer_splits: bool = False,
+    sample_fraction: Optional[float] = None,
+    seed: int = 42,
+) -> dict:
+    raw_df = spark.read.parquet(data_path)
+    if row_filter:
+        raw_df = raw_df.filter(row_filter)
+
+    model_df = prepare_modeling_frame(
+        raw_df,
+        target_col=target_col,
+        date_col=date_col,
+        sample_fraction=sample_fraction,
+        seed=seed,
+    )
+
+    numeric_cols, linear_cat_cols, tree_cat_cols = resolve_feature_columns(model_df)
+
+    if auto_infer_splits or train_end is None or valid_end is None:
+        train_end, valid_end = infer_time_split_boundaries(model_df, date_col=date_col)
+
+    train_df, valid_df, test_df = time_based_split(
+        model_df, date_col=date_col, train_end=train_end, valid_end=valid_end,
+    )
+    train_df = train_df.cache()
+    valid_df = valid_df.cache()
+    test_df = test_df.cache()
+
+    split_summary = describe_splits(train_df, valid_df, test_df, date_col=date_col)
+    if (split_summary["rows"] == 0).any():
+        raise ValueError(
+            "At least one split is empty. Adjust row_filter or the split boundaries."
+        )
+
+    return {
+        "model_df": model_df,
+        "train_df": train_df,
+        "valid_df": valid_df,
+        "test_df": test_df,
+        "split_summary": split_summary,
+        "numeric_cols": numeric_cols,
+        "linear_cat_cols": linear_cat_cols,
+        "tree_cat_cols": tree_cat_cols,
+    }
+
+
+def run_linear_search_and_eval(
+    train_df: DataFrame,
+    valid_df: DataFrame,
+    test_df: DataFrame,
+    numeric_cols: Sequence[str],
+    linear_cat_cols: Sequence[str],
+    lasso_reg_params: Sequence[float] = (0.001, 0.01, 0.05),
+    ridge_reg_params: Sequence[float] = (0.01, 0.10, 1.00),
+    linear_max_iter: int = 100,
+    delay_threshold: float = DEFAULT_DELAY_THRESHOLD,
+    severe_delay_threshold: float = DEFAULT_SEVERE_DELAY_THRESHOLD,
+) -> dict:
+    linear_numeric_cols, pruned_linear_cat_cols = prune_empty_feature_columns(
+        train_df, numeric_cols, linear_cat_cols,
+    )
+
+    best_lasso, lasso_search = search_linear_model(
+        train_df=train_df,
+        valid_df=valid_df,
+        numeric_columns=linear_numeric_cols,
+        categorical_columns=pruned_linear_cat_cols,
+        reg_params=lasso_reg_params,
+        elastic_net_param=1.0,
+        model_name="Lasso",
+        max_iter=linear_max_iter,
+        delay_threshold=delay_threshold,
+        severe_delay_threshold=severe_delay_threshold,
+    )
+
+    best_ridge, ridge_search = search_linear_model(
+        train_df=train_df,
+        valid_df=valid_df,
+        numeric_columns=linear_numeric_cols,
+        categorical_columns=pruned_linear_cat_cols,
+        reg_params=ridge_reg_params,
+        elastic_net_param=0.0,
+        model_name="Ridge",
+        max_iter=linear_max_iter,
+        delay_threshold=delay_threshold,
+        severe_delay_threshold=severe_delay_threshold,
+    )
+
+    train_valid_df = train_df.unionByName(valid_df).cache()
+
+    lasso_model = fit_linear_model(
+        train_df=train_valid_df,
+        numeric_columns=linear_numeric_cols,
+        categorical_columns=pruned_linear_cat_cols,
+        reg_param=best_lasso["regParam"],
+        elastic_net_param=best_lasso["elasticNetParam"],
+        max_iter=int(best_lasso["maxIter"]),
+    )
+
+    ridge_model = fit_linear_model(
+        train_df=train_valid_df,
+        numeric_columns=linear_numeric_cols,
+        categorical_columns=pruned_linear_cat_cols,
+        reg_param=best_ridge["regParam"],
+        elastic_net_param=best_ridge["elasticNetParam"],
+        max_iter=int(best_ridge["maxIter"]),
+    )
+
+    lasso_test = {
+        **evaluate_model(lasso_model, test_df, model_name="Lasso", split_name="test",
+                         delay_threshold=delay_threshold, severe_delay_threshold=severe_delay_threshold),
+        "regParam": best_lasso["regParam"],
+        "elasticNetParam": best_lasso["elasticNetParam"],
+        "maxIter": best_lasso["maxIter"],
+    }
+    ridge_test = {
+        **evaluate_model(ridge_model, test_df, model_name="Ridge", split_name="test",
+                         delay_threshold=delay_threshold, severe_delay_threshold=severe_delay_threshold),
+        "regParam": best_ridge["regParam"],
+        "elasticNetParam": best_ridge["elasticNetParam"],
+        "maxIter": best_ridge["maxIter"],
+    }
+
+    return {
+        "lasso_model": lasso_model,
+        "ridge_model": ridge_model,
+        "best_lasso": best_lasso,
+        "best_ridge": best_ridge,
+        "lasso_search": lasso_search,
+        "ridge_search": ridge_search,
+        "lasso_test": lasso_test,
+        "ridge_test": ridge_test,
+        "train_valid_df": train_valid_df,
+        "linear_numeric_cols": linear_numeric_cols,
+        "linear_cat_cols": pruned_linear_cat_cols,
+    }
+
+
+def run_gbt_search_and_eval(
+    train_df: DataFrame,
+    valid_df: DataFrame,
+    test_df: DataFrame,
+    numeric_cols: Sequence[str],
+    tree_cat_cols: Sequence[str],
+    gbt_param_grid: Sequence[Dict[str, float]] = (
+        {"maxDepth": 5, "maxIter": 40, "stepSize": 0.05},
+        {"maxDepth": 7, "maxIter": 60, "stepSize": 0.05},
+        {"maxDepth": 5, "maxIter": 80, "stepSize": 0.10},
+    ),
+    delay_threshold: float = DEFAULT_DELAY_THRESHOLD,
+    severe_delay_threshold: float = DEFAULT_SEVERE_DELAY_THRESHOLD,
+    seed: int = 42,
+    train_valid_df: Optional[DataFrame] = None,
+) -> dict:
+    gbt_numeric_cols, gbt_cat_cols = prune_empty_feature_columns(
+        train_df, numeric_cols, tree_cat_cols,
+    )
+
+    best_gbt, gbt_search = search_gbt_model(
+        train_df=train_df,
+        valid_df=valid_df,
+        numeric_columns=gbt_numeric_cols,
+        categorical_columns=gbt_cat_cols,
+        param_grid=gbt_param_grid,
+        model_name="GBT",
+        delay_threshold=delay_threshold,
+        severe_delay_threshold=severe_delay_threshold,
+        seed=seed,
+    )
+
+    if train_valid_df is None:
+        train_valid_df = train_df.unionByName(valid_df).cache()
+
+    gbt_model = fit_gbt_model(
+        train_df=train_valid_df,
+        numeric_columns=gbt_numeric_cols,
+        categorical_columns=gbt_cat_cols,
+        max_depth=int(best_gbt["maxDepth"]),
+        max_iter=int(best_gbt["maxIter"]),
+        step_size=float(best_gbt["stepSize"]),
+        seed=seed,
+    )
+
+    gbt_test = {
+        **evaluate_model(gbt_model, test_df, model_name="GBT", split_name="test",
+                         delay_threshold=delay_threshold, severe_delay_threshold=severe_delay_threshold),
+        "maxDepth": best_gbt["maxDepth"],
+        "maxIter": best_gbt["maxIter"],
+        "stepSize": best_gbt["stepSize"],
+    }
+
+    return {
+        "gbt_model": gbt_model,
+        "best_gbt": best_gbt,
+        "gbt_search": gbt_search,
+        "gbt_test": gbt_test,
+        "train_valid_df": train_valid_df,
+        "gbt_numeric_cols": gbt_numeric_cols,
+        "gbt_cat_cols": gbt_cat_cols,
+    }
+
+
+def _collect_base_predictions(
+    models: Dict[str, PipelineModel],
+    df: DataFrame,
+) -> Tuple[DataFrame, List[str]]:
+    df_with_id = df.withColumn("_row_id", F.monotonically_increasing_id())
+    base = df_with_id.select("_row_id", "label")
+
+    pred_col_names = []
+    for name, model in models.items():
+        col_name = f"{name}_pred"
+        pred_col_names.append(col_name)
+        preds = model.transform(df_with_id).select(
+            "_row_id", F.col("prediction").alias(col_name),
+        )
+        base = base.join(preds, "_row_id")
+
+    return base.drop("_row_id"), pred_col_names
+
+
+def fit_stacking_ensemble(
+    base_models_train: Dict[str, PipelineModel],
+    base_models_final: Dict[str, PipelineModel],
+    valid_df: DataFrame,
+    test_df: DataFrame,
+    meta_reg_param: float = 0.01,
+    delay_threshold: float = DEFAULT_DELAY_THRESHOLD,
+    severe_delay_threshold: float = DEFAULT_SEVERE_DELAY_THRESHOLD,
+) -> dict:
+    valid_preds, pred_cols = _collect_base_predictions(base_models_train, valid_df)
+    valid_preds = valid_preds.cache()
+
+    assembler = VectorAssembler(
+        inputCols=pred_cols, outputCol="meta_features", handleInvalid="keep",
+    )
+    meta_lr = LinearRegression(
+        featuresCol="meta_features",
+        labelCol="label",
+        predictionCol="prediction",
+        regParam=float(meta_reg_param),
+        elasticNetParam=0.0,
+        maxIter=100,
+    )
+    meta_pipeline = Pipeline(stages=[assembler, meta_lr])
+    meta_model = meta_pipeline.fit(valid_preds)
+
+    test_preds, _ = _collect_base_predictions(base_models_final, test_df)
+    test_preds = test_preds.cache()
+
+    stacked_test = meta_model.transform(test_preds).select("label", "prediction").cache()
+    metrics = evaluate_predictions(
+        stacked_test,
+        delay_threshold=delay_threshold,
+        severe_delay_threshold=severe_delay_threshold,
+    )
+    stacked_test.unpersist()
+
+    meta_coefficients = list(meta_model.stages[-1].coefficients)
+    meta_intercept = float(meta_model.stages[-1].intercept)
+
+    weights = pd.DataFrame({
+        "base_model": pred_cols,
+        "weight": meta_coefficients,
+    }).sort_values("weight", ascending=False).reset_index(drop=True)
+
+    return {
+        "meta_model": meta_model,
+        "stacked_test_metrics": {"model": "StackingEnsemble", "split": "test", **metrics},
+        "meta_weights": weights,
+        "meta_intercept": meta_intercept,
+        "valid_preds": valid_preds,
+        "test_preds": test_preds,
+    }
