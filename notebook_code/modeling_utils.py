@@ -5,7 +5,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import pandas as pd
 from pyspark.ml import Pipeline, PipelineModel
 from pyspark.ml.evaluation import RegressionEvaluator
-from pyspark.ml.feature import Imputer, OneHotEncoder, StandardScaler, StringIndeload_and_prepare_dataxer, VectorAssembler
+from pyspark.ml.feature import (
+    Imputer,
+    OneHotEncoder,
+    StandardScaler,
+    StringIndexer,
+    VectorAssembler,
+)
 from pyspark.ml.regression import GBTRegressor, LinearRegression, RandomForestRegressor
 from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
@@ -31,7 +37,10 @@ ENGINEERED_NUMERIC_CANDIDATES = [
     "MONTH",
     "QUARTER",
     "scheduled_dep_hour",
+    "dep_hour_sin",
+    "dep_hour_cos",
     "is_weekend",
+    "weather_severity",
 ]
 
 WEATHER_FLAG_COLUMNS = [
@@ -87,7 +96,12 @@ def _numeric_from_string(column_name: str, trace_to_zero: bool = False):
     trace_marker = raw.rlike(r"^[Tt](?:s)?$")
 
     return (
-        F.when(raw.isNull() | (raw == "") | raw.isin("NULL", "null", "NA", "na", "M", "m", "*"), None)
+        F.when(
+            raw.isNull()
+            | (raw == "")
+            | raw.isin("NULL", "null", "NA", "na", "M", "m", "*"),
+            None,
+        )
         .when(F.lit(trace_to_zero) & trace_marker, F.lit(0.0))
         .when(numeric_text == "", None)
         .otherwise(numeric_text.cast("double"))
@@ -110,12 +124,18 @@ def prepare_modeling_frame(
         frame = frame.sample(withReplacement=False, fraction=sample_fraction, seed=seed)
 
     frame = frame.withColumn(date_col, F.to_date(F.col(date_col)))
-    frame = frame.filter(F.col(date_col).isNotNull()).filter(F.col(target_col).isNotNull())
+    frame = frame.filter(F.col(date_col).isNotNull()).filter(
+        F.col(target_col).isNotNull()
+    )
 
     if "CANCELLED" in frame.columns:
-        frame = frame.filter(F.coalesce(F.col("CANCELLED").cast("double"), F.lit(0.0)) == 0.0)
+        frame = frame.filter(
+            F.coalesce(F.col("CANCELLED").cast("double"), F.lit(0.0)) == 0.0
+        )
     if "DIVERTED" in frame.columns:
-        frame = frame.filter(F.coalesce(F.col("DIVERTED").cast("double"), F.lit(0.0)) == 0.0)
+        frame = frame.filter(
+            F.coalesce(F.col("DIVERTED").cast("double"), F.lit(0.0)) == 0.0
+        )
 
     if "DISTANCE" in frame.columns:
         frame = frame.withColumn("DISTANCE", F.col("DISTANCE").cast("double"))
@@ -129,43 +149,80 @@ def prepare_modeling_frame(
             4,
             "0",
         )
-        frame = frame.withColumn("scheduled_dep_hour", F.substring(dep_time_text, 1, 2).cast("double"))
+        frame = frame.withColumn(
+            "scheduled_dep_hour", F.substring(dep_time_text, 1, 2).cast("double")
+        )
     else:
         frame = frame.withColumn("scheduled_dep_hour", F.lit(None).cast("double"))
+
+    _hour_radians = F.col("scheduled_dep_hour") * (2.0 * 3.141592653589793 / 24.0)
+    frame = frame.withColumn("dep_hour_sin", F.sin(_hour_radians))
+    frame = frame.withColumn("dep_hour_cos", F.cos(_hour_radians))
 
     if "DAY_OF_WEEK" in frame.columns:
         frame = frame.withColumn(
             "is_weekend",
-            F.when(F.col("DAY_OF_WEEK").isin(6.0, 7.0), F.lit(1.0)).otherwise(F.lit(0.0)),
+            F.when(F.col("DAY_OF_WEEK").isin(6.0, 7.0), F.lit(1.0)).otherwise(
+                F.lit(0.0)
+            ),
         )
     else:
         frame = frame.withColumn("is_weekend", F.lit(0.0))
 
     if "HourlyPresentWeatherType" in frame.columns:
-        weather_text = F.upper(F.coalesce(F.col("HourlyPresentWeatherType").cast("string"), F.lit("")))
-        frame = frame.withColumn("has_rain", F.when(weather_text.rlike(r"RA|DZ|SH"), 1.0).otherwise(0.0))
-        frame = frame.withColumn("has_snow", F.when(weather_text.rlike(r"SN|SG|PL|IC"), 1.0).otherwise(0.0))
-        frame = frame.withColumn("has_fog", F.when(weather_text.rlike(r"FG|BR|HZ"), 1.0).otherwise(0.0))
-        frame = frame.withColumn("has_thunder", F.when(weather_text.rlike(r"TS"), 1.0).otherwise(0.0))
+        weather_text = F.upper(
+            F.coalesce(F.col("HourlyPresentWeatherType").cast("string"), F.lit(""))
+        )
+        frame = frame.withColumn(
+            "has_rain", F.when(weather_text.rlike(r"RA|DZ|SH"), 1.0).otherwise(0.0)
+        )
+        frame = frame.withColumn(
+            "has_snow", F.when(weather_text.rlike(r"SN|SG|PL|IC"), 1.0).otherwise(0.0)
+        )
+        frame = frame.withColumn(
+            "has_fog", F.when(weather_text.rlike(r"FG|BR|HZ"), 1.0).otherwise(0.0)
+        )
+        frame = frame.withColumn(
+            "has_thunder", F.when(weather_text.rlike(r"TS"), 1.0).otherwise(0.0)
+        )
     else:
         for flag_column in WEATHER_FLAG_COLUMNS:
             frame = frame.withColumn(flag_column, F.lit(0.0))
+
+    frame = frame.withColumn(
+        "weather_severity",
+        F.col("has_rain")
+        + 2.0 * F.col("has_snow")
+        + F.col("has_fog")
+        + 3.0 * F.col("has_thunder"),
+    )
 
     parsed_numeric_columns: List[str] = []
     for raw_column, trace_to_zero in RAW_NUMERIC_SPECS.items():
         parsed_column = f"{raw_column}_num"
         if raw_column in frame.columns:
-            frame = frame.withColumn(parsed_column, _numeric_from_string(raw_column, trace_to_zero=trace_to_zero))
+            frame = frame.withColumn(
+                parsed_column,
+                _numeric_from_string(raw_column, trace_to_zero=trace_to_zero),
+            )
             parsed_numeric_columns.append(parsed_column)
 
     frame = frame.withColumn("label", F.col(target_col).cast("double"))
 
     keep_columns = _unique(
         [date_col, "label"]
-        + [column for column in ENGINEERED_NUMERIC_CANDIDATES if column in frame.columns]
+        + [
+            column
+            for column in ENGINEERED_NUMERIC_CANDIDATES
+            if column in frame.columns
+        ]
         + parsed_numeric_columns
         + [column for column in WEATHER_FLAG_COLUMNS if column in frame.columns]
-        + [column for column in LINEAR_CATEGORICAL_CANDIDATES if column in frame.columns]
+        + [
+            column
+            for column in LINEAR_CATEGORICAL_CANDIDATES
+            if column in frame.columns
+        ]
     )
 
     return frame.select(*keep_columns)
@@ -178,7 +235,9 @@ def infer_time_split_boundaries(
     valid_ratio: float = 0.15,
 ) -> Tuple[str, str]:
     if train_ratio <= 0 or valid_ratio <= 0 or train_ratio + valid_ratio >= 1:
-        raise ValueError("train_ratio and valid_ratio must be positive and sum to less than 1.")
+        raise ValueError(
+            "train_ratio and valid_ratio must be positive and sum to less than 1."
+        )
 
     dates = [
         row[0]
@@ -190,10 +249,15 @@ def infer_time_split_boundaries(
     ]
 
     if len(dates) < 3:
-        raise ValueError("Need at least three distinct dates to infer train/validation/test boundaries.")
+        raise ValueError(
+            "Need at least three distinct dates to infer train/validation/test boundaries."
+        )
 
     train_index = max(0, min(len(dates) - 3, int(len(dates) * train_ratio) - 1))
-    valid_index = max(train_index + 1, min(len(dates) - 2, int(len(dates) * (train_ratio + valid_ratio)) - 1))
+    valid_index = max(
+        train_index + 1,
+        min(len(dates) - 2, int(len(dates) * (train_ratio + valid_ratio)) - 1),
+    )
 
     return dates[train_index].isoformat(), dates[valid_index].isoformat()
 
@@ -208,7 +272,9 @@ def time_based_split(
     valid_end_date = F.to_date(F.lit(str(valid_end)))
 
     train_df = df.filter(F.col(date_col) <= train_end_date)
-    valid_df = df.filter((F.col(date_col) > train_end_date) & (F.col(date_col) <= valid_end_date))
+    valid_df = df.filter(
+        (F.col(date_col) > train_end_date) & (F.col(date_col) <= valid_end_date)
+    )
     test_df = df.filter(F.col(date_col) > valid_end_date)
 
     return train_df, valid_df, test_df
@@ -221,7 +287,11 @@ def describe_splits(
     date_col: str = "FL_DATE",
 ) -> pd.DataFrame:
     rows = []
-    for split_name, frame in [("train", train_df), ("validation", valid_df), ("test", test_df)]:
+    for split_name, frame in [
+        ("train", train_df),
+        ("validation", valid_df),
+        ("test", test_df),
+    ]:
         stats = (
             frame.agg(
                 F.count("*").alias("rows"),
@@ -241,12 +311,26 @@ def describe_splits(
 def resolve_feature_columns(df: DataFrame) -> Tuple[List[str], List[str], List[str]]:
     numeric_columns = _unique(
         [column for column in ENGINEERED_NUMERIC_CANDIDATES if column in df.columns]
-        + [f"{column}_num" for column in RAW_NUMERIC_SPECS if f"{column}_num" in df.columns]
+        + [
+            f"{column}_num"
+            for column in RAW_NUMERIC_SPECS
+            if f"{column}_num" in df.columns
+        ]
         + [column for column in WEATHER_FLAG_COLUMNS if column in df.columns]
     )
     linear_categorical = _unique(
         _first_available(df, ["OP_CARRIER", "OP_UNIQUE_CARRIER"])
-        + [column for column in ["ORIGIN", "DEST", "DEP_TIME_BLK", "ORIGIN_STATE_ABR", "DEST_STATE_ABR"] if column in df.columns]
+        + [
+            column
+            for column in [
+                "ORIGIN",
+                "DEST",
+                "DEP_TIME_BLK",
+                "ORIGIN_STATE_ABR",
+                "DEST_STATE_ABR",
+            ]
+            if column in df.columns
+        ]
     )
     gbt_categorical = _unique(
         _first_available(df, ["OP_CARRIER", "OP_UNIQUE_CARRIER"])
@@ -266,13 +350,17 @@ def prune_empty_feature_columns(
         raise ValueError("No feature columns were provided.")
 
     counts = (
-        df.select([F.count(F.col(column)).alias(column) for column in candidate_columns])
+        df.select(
+            [F.count(F.col(column)).alias(column) for column in candidate_columns]
+        )
         .collect()[0]
         .asDict()
     )
 
     usable_numeric = [column for column in numeric_columns if counts.get(column, 0) > 0]
-    usable_categorical = [column for column in categorical_columns if counts.get(column, 0) > 0]
+    usable_categorical = [
+        column for column in categorical_columns if counts.get(column, 0) > 0
+    ]
 
     if not usable_numeric and not usable_categorical:
         raise ValueError("All candidate feature columns are empty after filtering.")
@@ -301,14 +389,22 @@ def _build_linear_pipeline(
             ]
         )
         stages.append(
-            OneHotEncoder(inputCols=indexed_columns, outputCols=encoded_columns, handleInvalid="keep")
+            OneHotEncoder(
+                inputCols=indexed_columns,
+                outputCols=encoded_columns,
+                handleInvalid="keep",
+            )
         )
         feature_inputs.extend(encoded_columns)
 
     if numeric_columns:
         imputed_columns = [f"{column}_imp" for column in numeric_columns]
         stages.append(
-            Imputer(strategy="median", inputCols=list(numeric_columns), outputCols=imputed_columns)
+            Imputer(
+                strategy="median",
+                inputCols=list(numeric_columns),
+                outputCols=imputed_columns,
+            )
         )
         stages.append(
             VectorAssembler(
@@ -328,7 +424,9 @@ def _build_linear_pipeline(
         feature_inputs.insert(0, "scaled_numeric_features")
 
     stages.append(
-        VectorAssembler(inputCols=feature_inputs, outputCol="features", handleInvalid="keep")
+        VectorAssembler(
+            inputCols=feature_inputs, outputCol="features", handleInvalid="keep"
+        )
     )
     stages.append(
         LinearRegression(
@@ -367,19 +465,29 @@ def _build_gbt_pipeline(
             ]
         )
         stages.append(
-            OneHotEncoder(inputCols=indexed_columns, outputCols=encoded_columns, handleInvalid="keep")
+            OneHotEncoder(
+                inputCols=indexed_columns,
+                outputCols=encoded_columns,
+                handleInvalid="keep",
+            )
         )
         feature_inputs.extend(encoded_columns)
 
     if numeric_columns:
         imputed_columns = [f"{column}_imp" for column in numeric_columns]
         stages.append(
-            Imputer(strategy="median", inputCols=list(numeric_columns), outputCols=imputed_columns)
+            Imputer(
+                strategy="median",
+                inputCols=list(numeric_columns),
+                outputCols=imputed_columns,
+            )
         )
         feature_inputs = imputed_columns + feature_inputs
 
     stages.append(
-        VectorAssembler(inputCols=feature_inputs, outputCol="features", handleInvalid="keep")
+        VectorAssembler(
+            inputCols=feature_inputs, outputCol="features", handleInvalid="keep"
+        )
     )
     stages.append(
         GBTRegressor(
@@ -401,7 +509,7 @@ def _build_rf_pipeline(
     numeric_columns: Sequence[str],
     categorical_columns: Sequence[str],
     num_trees: int,
-    # max_depth: int,
+    max_depth: int = 5,
     max_bins: int = 32,
     subsampling_rate: float = 0.8,
     seed: int = 42,
@@ -420,19 +528,29 @@ def _build_rf_pipeline(
             ]
         )
         stages.append(
-            OneHotEncoder(inputCols=indexed_columns, outputCols=encoded_columns, handleInvalid="keep")
+            OneHotEncoder(
+                inputCols=indexed_columns,
+                outputCols=encoded_columns,
+                handleInvalid="keep",
+            )
         )
         feature_inputs.extend(encoded_columns)
 
     if numeric_columns:
         imputed_columns = [f"{column}_imp" for column in numeric_columns]
         stages.append(
-            Imputer(strategy="median", inputCols=list(numeric_columns), outputCols=imputed_columns)
+            Imputer(
+                strategy="median",
+                inputCols=list(numeric_columns),
+                outputCols=imputed_columns,
+            )
         )
         feature_inputs = imputed_columns + feature_inputs
 
     stages.append(
-        VectorAssembler(inputCols=feature_inputs, outputCol="features", handleInvalid="keep")
+        VectorAssembler(
+            inputCols=feature_inputs, outputCol="features", handleInvalid="keep"
+        )
     )
     stages.append(
         RandomForestRegressor(
@@ -440,8 +558,8 @@ def _build_rf_pipeline(
             labelCol="label",
             predictionCol="prediction",
             numTrees=int(num_trees),
-            # maxDepth=int(max_depth),
-            # maxBins=int(max_bins),
+            maxDepth=int(max_depth),
+            maxBins=int(max_bins),
             subsamplingRate=float(subsampling_rate),
             seed=int(seed),
         )
@@ -469,7 +587,7 @@ def search_rf_model(
             numeric_columns=numeric_columns,
             categorical_columns=categorical_columns,
             num_trees=int(params["numTrees"]),
-            # max_depth=int(params["maxDepth"]),
+            max_depth=int(params["maxDepth"]),
             max_bins=int(params.get("maxBins", 32)),
             subsampling_rate=float(params.get("subsamplingRate", 0.8)),
             seed=seed,
@@ -505,7 +623,7 @@ def fit_rf_model(
     numeric_columns: Sequence[str],
     categorical_columns: Sequence[str],
     num_trees: int,
-    # max_depth: int,
+    max_depth: int = 5,
     max_bins: int = 32,
     subsampling_rate: float = 0.8,
     seed: int = 42,
@@ -514,7 +632,7 @@ def fit_rf_model(
         numeric_columns=numeric_columns,
         categorical_columns=categorical_columns,
         num_trees=num_trees,
-        # max_depth=max_depth,
+        max_depth=max_depth,
         max_bins=max_bins,
         subsampling_rate=subsampling_rate,
         seed=seed,
@@ -530,7 +648,11 @@ def top_rf_importances(
     feature_names = _feature_metadata(model, reference_df)
     importances = list(model.stages[-1].featureImportances.toArray())
     table = pd.DataFrame({"feature": feature_names, "importance": importances})
-    return table.sort_values("importance", ascending=False).head(top_n).reset_index(drop=True)
+    return (
+        table.sort_values("importance", ascending=False)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
 
 
 def evaluate_predictions(
@@ -562,36 +684,66 @@ def evaluate_predictions(
         ),
     }
 
-    metrics = {name: evaluator.evaluate(clean_predictions) for name, evaluator in evaluators.items()}
+    metrics = {
+        name: evaluator.evaluate(clean_predictions)
+        for name, evaluator in evaluators.items()
+    }
 
     scored = (
         clean_predictions.select(label_col, prediction_col)
-        .withColumn("actual_delayed", (F.col(label_col) > F.lit(delay_threshold)).cast("int"))
-        .withColumn("predicted_delayed", (F.col(prediction_col) > F.lit(delay_threshold)).cast("int"))
-        .withColumn("actual_severe", (F.col(label_col) > F.lit(severe_delay_threshold)).cast("int"))
-        .withColumn("predicted_severe", (F.col(prediction_col) > F.lit(severe_delay_threshold)).cast("int"))
+        .withColumn(
+            "actual_delayed", (F.col(label_col) > F.lit(delay_threshold)).cast("int")
+        )
+        .withColumn(
+            "predicted_delayed",
+            (F.col(prediction_col) > F.lit(delay_threshold)).cast("int"),
+        )
+        .withColumn(
+            "actual_severe",
+            (F.col(label_col) > F.lit(severe_delay_threshold)).cast("int"),
+        )
+        .withColumn(
+            "predicted_severe",
+            (F.col(prediction_col) > F.lit(severe_delay_threshold)).cast("int"),
+        )
     )
 
     counts = (
         scored.agg(
             F.count("*").alias("rows"),
             F.sum(
-                F.when((F.col("actual_delayed") == 1) & (F.col("predicted_delayed") == 1), 1).otherwise(0)
+                F.when(
+                    (F.col("actual_delayed") == 1) & (F.col("predicted_delayed") == 1),
+                    1,
+                ).otherwise(0)
             ).alias("tp_delayed"),
             F.sum(
-                F.when((F.col("actual_delayed") == 0) & (F.col("predicted_delayed") == 0), 1).otherwise(0)
+                F.when(
+                    (F.col("actual_delayed") == 0) & (F.col("predicted_delayed") == 0),
+                    1,
+                ).otherwise(0)
             ).alias("tn_delayed"),
             F.sum(
-                F.when((F.col("actual_delayed") == 0) & (F.col("predicted_delayed") == 1), 1).otherwise(0)
+                F.when(
+                    (F.col("actual_delayed") == 0) & (F.col("predicted_delayed") == 1),
+                    1,
+                ).otherwise(0)
             ).alias("fp_delayed"),
             F.sum(
-                F.when((F.col("actual_delayed") == 1) & (F.col("predicted_delayed") == 0), 1).otherwise(0)
+                F.when(
+                    (F.col("actual_delayed") == 1) & (F.col("predicted_delayed") == 0),
+                    1,
+                ).otherwise(0)
             ).alias("fn_delayed"),
             F.sum(
-                F.when((F.col("actual_severe") == 1) & (F.col("predicted_severe") == 1), 1).otherwise(0)
+                F.when(
+                    (F.col("actual_severe") == 1) & (F.col("predicted_severe") == 1), 1
+                ).otherwise(0)
             ).alias("tp_severe"),
             F.sum(
-                F.when((F.col("actual_severe") == 1) & (F.col("predicted_severe") == 0), 1).otherwise(0)
+                F.when(
+                    (F.col("actual_severe") == 1) & (F.col("predicted_severe") == 0), 1
+                ).otherwise(0)
             ).alias("fn_severe"),
         )
         .collect()[0]
@@ -617,8 +769,13 @@ def evaluate_predictions(
     )
     metrics["F1"] = (
         None
-        if precision_delayed is None or recall_delayed is None or (precision_delayed + recall_delayed) == 0
-        else 2 * precision_delayed * recall_delayed / (precision_delayed + recall_delayed)
+        if precision_delayed is None
+        or recall_delayed is None
+        or (precision_delayed + recall_delayed) == 0
+        else 2
+        * precision_delayed
+        * recall_delayed
+        / (precision_delayed + recall_delayed)
     )
     metrics["rows"] = counts["rows"]
 
@@ -810,7 +967,11 @@ def top_linear_coefficients(
     coefficients = list(model.stages[-1].coefficients)
     table = pd.DataFrame({"feature": feature_names, "coefficient": coefficients})
     table["abs_coefficient"] = table["coefficient"].abs()
-    return table.sort_values("abs_coefficient", ascending=False).head(top_n).reset_index(drop=True)
+    return (
+        table.sort_values("abs_coefficient", ascending=False)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
 
 
 def top_gbt_importances(
@@ -821,7 +982,11 @@ def top_gbt_importances(
     feature_names = _feature_metadata(model, reference_df)
     importances = list(model.stages[-1].featureImportances.toArray())
     table = pd.DataFrame({"feature": feature_names, "importance": importances})
-    return table.sort_values("importance", ascending=False).head(top_n).reset_index(drop=True)
+    return (
+        table.sort_values("importance", ascending=False)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
 
 
 def load_and_prepare_data(
@@ -854,7 +1019,10 @@ def load_and_prepare_data(
         train_end, valid_end = infer_time_split_boundaries(model_df, date_col=date_col)
 
     train_df, valid_df, test_df = time_based_split(
-        model_df, date_col=date_col, train_end=train_end, valid_end=valid_end,
+        model_df,
+        date_col=date_col,
+        train_end=train_end,
+        valid_end=valid_end,
     )
     train_df = train_df.cache()
     valid_df = valid_df.cache()
@@ -891,7 +1059,9 @@ def run_linear_search_and_eval(
     severe_delay_threshold: float = DEFAULT_SEVERE_DELAY_THRESHOLD,
 ) -> dict:
     linear_numeric_cols, pruned_linear_cat_cols = prune_empty_feature_columns(
-        train_df, numeric_cols, linear_cat_cols,
+        train_df,
+        numeric_cols,
+        linear_cat_cols,
     )
 
     best_lasso, lasso_search = search_linear_model(
@@ -941,15 +1111,27 @@ def run_linear_search_and_eval(
     )
 
     lasso_test = {
-        **evaluate_model(lasso_model, test_df, model_name="Lasso", split_name="test",
-                         delay_threshold=delay_threshold, severe_delay_threshold=severe_delay_threshold),
+        **evaluate_model(
+            lasso_model,
+            test_df,
+            model_name="Lasso",
+            split_name="test",
+            delay_threshold=delay_threshold,
+            severe_delay_threshold=severe_delay_threshold,
+        ),
         "regParam": best_lasso["regParam"],
         "elasticNetParam": best_lasso["elasticNetParam"],
         "maxIter": best_lasso["maxIter"],
     }
     ridge_test = {
-        **evaluate_model(ridge_model, test_df, model_name="Ridge", split_name="test",
-                         delay_threshold=delay_threshold, severe_delay_threshold=severe_delay_threshold),
+        **evaluate_model(
+            ridge_model,
+            test_df,
+            model_name="Ridge",
+            split_name="test",
+            delay_threshold=delay_threshold,
+            severe_delay_threshold=severe_delay_threshold,
+        ),
         "regParam": best_ridge["regParam"],
         "elasticNetParam": best_ridge["elasticNetParam"],
         "maxIter": best_ridge["maxIter"],
@@ -987,7 +1169,9 @@ def run_gbt_search_and_eval(
     train_valid_df: Optional[DataFrame] = None,
 ) -> dict:
     gbt_numeric_cols, gbt_cat_cols = prune_empty_feature_columns(
-        train_df, numeric_cols, tree_cat_cols,
+        train_df,
+        numeric_cols,
+        tree_cat_cols,
     )
 
     best_gbt, gbt_search = search_gbt_model(
@@ -1016,8 +1200,14 @@ def run_gbt_search_and_eval(
     )
 
     gbt_test = {
-        **evaluate_model(gbt_model, test_df, model_name="GBT", split_name="test",
-                         delay_threshold=delay_threshold, severe_delay_threshold=severe_delay_threshold),
+        **evaluate_model(
+            gbt_model,
+            test_df,
+            model_name="GBT",
+            split_name="test",
+            delay_threshold=delay_threshold,
+            severe_delay_threshold=severe_delay_threshold,
+        ),
         "maxDepth": best_gbt["maxDepth"],
         "maxIter": best_gbt["maxIter"],
         "stepSize": best_gbt["stepSize"],
@@ -1046,7 +1236,8 @@ def _collect_base_predictions(
         col_name = f"{name}_pred"
         pred_col_names.append(col_name)
         preds = model.transform(df_with_id).select(
-            "_row_id", F.col("prediction").alias(col_name),
+            "_row_id",
+            F.col("prediction").alias(col_name),
         )
         base = base.join(preds, "_row_id")
 
@@ -1066,7 +1257,9 @@ def fit_stacking_ensemble(
     valid_preds = valid_preds.cache()
 
     assembler = VectorAssembler(
-        inputCols=pred_cols, outputCol="meta_features", handleInvalid="keep",
+        inputCols=pred_cols,
+        outputCol="meta_features",
+        handleInvalid="keep",
     )
     meta_lr = LinearRegression(
         featuresCol="meta_features",
@@ -1074,7 +1267,7 @@ def fit_stacking_ensemble(
         predictionCol="prediction",
         regParam=float(meta_reg_param),
         elasticNetParam=0.0,
-        maxIter=100,
+        maxIter=1000,
     )
     meta_pipeline = Pipeline(stages=[assembler, meta_lr])
     meta_model = meta_pipeline.fit(valid_preds)
@@ -1082,7 +1275,9 @@ def fit_stacking_ensemble(
     test_preds, _ = _collect_base_predictions(base_models_final, test_df)
     test_preds = test_preds.cache()
 
-    stacked_test = meta_model.transform(test_preds).select("label", "prediction").cache()
+    stacked_test = (
+        meta_model.transform(test_preds).select("label", "prediction").cache()
+    )
     metrics = evaluate_predictions(
         stacked_test,
         delay_threshold=delay_threshold,
@@ -1093,16 +1288,49 @@ def fit_stacking_ensemble(
     meta_coefficients = list(meta_model.stages[-1].coefficients)
     meta_intercept = float(meta_model.stages[-1].intercept)
 
-    weights = pd.DataFrame({
-        "base_model": pred_cols,
-        "weight": meta_coefficients,
-    }).sort_values("weight", ascending=False).reset_index(drop=True)
+    weights = (
+        pd.DataFrame(
+            {
+                "base_model": pred_cols,
+                "weight": meta_coefficients,
+            }
+        )
+        .sort_values("weight", ascending=False)
+        .reset_index(drop=True)
+    )
 
     return {
         "meta_model": meta_model,
-        "stacked_test_metrics": {"model": "StackingEnsemble", "split": "test", **metrics},
+        "stacked_test_metrics": {
+            "model": "StackingEnsemble",
+            "split": "test",
+            **metrics,
+        },
         "meta_weights": weights,
         "meta_intercept": meta_intercept,
         "valid_preds": valid_preds,
         "test_preds": test_preds,
     }
+
+
+def compute_route_avg_delay(
+    train_df: DataFrame,
+    origin_col: str = "ORIGIN",
+    dest_col: str = "DEST",
+) -> DataFrame:
+    """Compute historical average delay per ORIGIN-DEST route from training data only."""
+    return train_df.groupBy(origin_col, dest_col).agg(
+        F.avg("label").alias("route_avg_delay")
+    )
+
+
+def add_route_avg_delay(
+    df: DataFrame,
+    route_avgs: DataFrame,
+    origin_col: str = "ORIGIN",
+    dest_col: str = "DEST",
+) -> DataFrame:
+    """Join pre-computed route average delay onto a DataFrame, filling unseen routes with 0."""
+    return df.join(route_avgs, [origin_col, dest_col], "left").fillna(
+        0.0, subset=["route_avg_delay"]
+    )
