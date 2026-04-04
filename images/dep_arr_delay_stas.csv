@@ -1,0 +1,3 @@
+feature,min,max,mean,median,stddev
+DEP_DELAY,-82,1988,9.29,-2,36.87
+ARR_DELAY,-87,1971,4.41,-5,39.26
